@@ -1,0 +1,15 @@
+name: native-vision
+version: "1.0.0"
+description: Bypass auxiliary vision model and send images directly to vision-capable main LLMs
+config:
+  native_vision_enabled: true
+  max_image_dimension: 1024
+  max_total_image_tokens: 100000
+  vision_models:
+    - gpt-4o
+    - claude-sonnet-4
+    - claude-opus-4
+    - glm-5v-turbo
+    - gemini-2.0-flash
+    - kimi-k2
+    - qwen3.6-plus

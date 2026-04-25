@@ -1,0 +1,6 @@
+name: multi-agent-context
+version: 1.0.0
+description: "Injects recent Discord channel history into agent context via pre_llm_call hook. Enables multi-agent awareness — agents in a shared channel see what others said without core patches."
+author: "Furina (Hermes Agent)"
+hooks:
+  - pre_llm_call
