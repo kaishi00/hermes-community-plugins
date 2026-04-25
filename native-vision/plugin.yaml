@@ -1,7 +1,7 @@
 name: native-vision
 version: "1.0.0"
 description: Bypass auxiliary vision model and send images directly to vision-capable main LLMs
-author: "Kaishi (@kaishi00)"
+author: "kaishi00"
 config:
   native_vision_enabled: true
   max_image_dimension: 1024
