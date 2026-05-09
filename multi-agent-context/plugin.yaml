@@ -1,6 +1,7 @@
 name: multi-agent-context
-version: 1.0.0
-description: "Injects recent Discord channel history into agent context via pre_llm_call hook. Enables multi-agent awareness — agents in a shared channel see what others said without core patches."
+version: 2.0.0
+description: "Injects shared channel/group history (Discord + Telegram) into agent context via pre_llm_call hook, and persists Telegram turns via post_llm_call to a shared SQLite DB. Enables multi-agent awareness across platforms without core patches."
 author: "Kaishi (@kaishi00)"
 hooks:
   - pre_llm_call
+  - post_llm_call
