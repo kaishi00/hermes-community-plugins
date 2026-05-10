@@ -186,7 +186,8 @@ def _tg_chat_key(session_id: str) -> str:
     if len(parts) >= 5:
         chat_type = parts[3]
         chat_id = parts[4]
-        if len(parts) > 5 and chat_type in ("dm", "thread"):
+        # Always include thread_id when present — Telegram groups use topics
+        if len(parts) > 5:
             return f"{chat_id}:{parts[5]}"
         return chat_id
 
@@ -195,6 +196,10 @@ def _tg_chat_key(session_id: str) -> str:
         from gateway.session_context import get_session_env
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
         if thread_id:
+            # Prefer thread_id with chat_id for uniqueness
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+            if chat_id:
+                return f"{chat_id}:{thread_id}"
             return str(thread_id)
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
         if chat_id:
