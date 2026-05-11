@@ -4,31 +4,80 @@ Battle-tested plugins for [Hermes Agent](https://github.com/NousResearch/hermes-
 
 ## Plugins
 
-### 1. [`native-vision/`](./native-vision/) ⚡
-Bypass the auxiliary vision model and send images directly to vision-capable main LLMs (GPT-4o, Claude Sonnet 4, GLM-5V-Turbo, etc.).
+### 1. [`async-delegate/`](./async-delegate/) 🚀
 
-- **What it solves:** Hermes routes all image analysis through an aux vision model (e.g., qwen-vl), even when your main model can see images natively. This adds latency, cost, and information loss (text description ≠ seeing pixels).
-- **How it works:** Runtime monkey-patching with signature-gated defensive checks. Inserts `[NATIVE_VISION_IMAGES:...]` markers into the text pipeline, then expands them into multimodal content blocks before the API call.
-- **Survives updates:** If Hermes changes a method signature, that patch silently skips itself instead of crashing.
-- **Patches 5 methods** across `gateway.run`, `cli`, and `run_agent` — all via `register(ctx)`.
+**Spawn background subagents without blocking the current conversation turn.**
+
+A Hermes Agent plugin that adds true async task delegation — fire off a subagent to work on something in the background while you keep chatting. When the task finishes, a notification is automatically injected back into the originating session.
+
+#### How It Works
+
+```
+┌─────────────┐    delegate_async     ┌──────────────────┐
+│   Agent      │ ──────────────────►   │  Subagent        │
+│   (turn)     │  returns task_id      │  (hermes chat)   │
+│              │  immediately          │  runs in bg      │
+│              │                       └──────┬───────────┘
+│  continues   │                              │
+│  chatting    │         .done file written    │
+│  normally    │              │                │
+└──────┬───────┘              ▼                │
+       │              ┌──────────────┐         │
+       │              │   Watcher    │◄────────┘
+       │              │   Thread     │  polls every 5s
+       │              │  (daemon)    │
+       │              └──────┬───────┘
+       │                     │
+       │   ◄─────────────────┘
+       │   notification injected
+       │   (queue or steer)
+       ▼
+```
+
+**Architecture:**
+- **`delegate_async` tool** — Agent calls this to spawn a background `hermes chat` process. Returns a `task_id` immediately. The agent's current turn is NOT blocked.
+- **File-based coordination** — Each task gets a set of files in `~/.hermes/async-tasks/` (JSON metadata, prompt, wrapper script, output, error, done marker).
+- **Watcher thread** — A daemon thread polls for `.done` files every 5 seconds. On completion, it injects a notification back into the originating session.
+- **Session injection** — Uses the gateway's internal APIs to deliver the notification, with fallback via `pre_llm_call` hook.
+
+#### Injection Modes
+
+| Mode | Behavior | Use For |
+|------|----------|---------|
+| **Queue** (default) | Notification waits for the current turn to finish, then delivers as a clean new turn | Background research, lookups, fire-and-forget tasks |
+| **Steer** | Notification is interleaved into the agent's active tool loop mid-turn | Results that might change what the agent is currently doing (API checks, validation, etc.) |
+
+#### Tools
+
+| Tool | Description |
+|------|-------------|
+| `delegate_async` | Spawns a background subagent. Returns `task_id` immediately. |
+| `check_async_tasks` | Check a specific task or list all tasks. Includes result preview for completed tasks. |
+
+#### Hooks
+
+| Hook | Purpose |
+|------|---------|
+| `pre_gateway_dispatch` | Captures `GatewayRunner` reference + session routing from incoming messages |
+| `pre_llm_call` | Fallback: scans for completed tasks before each LLM call |
+| `on_session_end` | Cleans up task files older than 24 hours |
+
+#### Key Design Decisions
+- **File-based, not database** — Simple, debuggable, no migration headaches.
+- **Session injection, not webhooks** — Works in any deployment, no external HTTP endpoints.
+- **Dual routing lookup** — In-memory dict (fast) + JSON fallback (survives gateway restarts).
 
 #### Quick Install
 ```bash
-cp -r native-vision ~/.hermes/plugins/native-vision
+cp -r async-delegate ~/.hermes/plugins/async-delegate
 # Add to config.yaml:
 #   plugins:
 #     enabled:
-#       - native-vision
+#       - async-delegate
 # Restart gateway
 ```
 
-#### Config (`plugin.yaml`)
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `native_vision_enabled` | `true` | Master on/off toggle |
-| `max_image_dimension` | `1024` | Resize max side in px (saves tokens) |
-| `max_total_image_tokens` | `100000` | Token budget for all images combined |
-| `vision_models` | *(see file)* | Model name allowlist (substring match) |
+No additional config needed. Drop the plugin folder into `~/.hermes/plugins/` and restart the gateway.
 
 ---
 
@@ -170,11 +219,32 @@ cp -r multi-agent-context ~/.hermes/plugins/multi-agent-context
 
 ---
 
+### 3. ~~[`native-vision/`](./native-vision/)~~ ⚡ — ⚠️ DEPRECATED
+
+> ⚠️ **Now a built-in feature in Hermes Agent v0.11.0+ — this plugin is no longer needed. Kept here for historical reference.**
+
+Bypass the auxiliary vision model and send images directly to vision-capable main LLMs (GPT-4o, Claude Sonnet 4, GLM-5V-Turbo, etc.).
+
+- **What it solved:** Hermes routes all image analysis through an aux vision model (e.g., qwen-vl), even when your main model can see images natively. This adds latency, cost, and information loss (text description ≠ seeing pixels).
+- **How it worked:** Runtime monkey-patching with signature-gated defensive checks. Inserts `[NATIVE_VISION_IMAGES:...]` markers into the text pipeline, then expands them into multimodal content blocks before the API call.
+- **Survives updates:** If Hermes changes a method signature, that patch silently skips itself instead of crashing.
+- **Patches 5 methods** across `gateway.run`, `cli`, and `run_agent` — all via `register(ctx)`.
+
+#### Config (`plugin.yaml`) — For Reference Only
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `native_vision_enabled` | `true` | Master on/off toggle |
+| `max_image_dimension` | `1024` | Resize max side in px (saves tokens) |
+| `max_total_image_tokens` | `100000` | Token budget for all images combined |
+| `vision_models` | *(see file)* | Model name allowlist (substring match) |
+
+---
+
 ## Requirements
 
 - **Hermes Agent v0.11.0+** with plugin system support
 - Python 3.11+
-- **`native-vision`:** `pip install Pillow`
+- **`async-delegate`:** No extra dependencies — uses Python stdlib only
 - **`multi-agent-context`:** `pip install requests` (usually already installed). Telegram path uses Python's built-in `sqlite3` — no extra deps.
 
 ## Deployment Notes
