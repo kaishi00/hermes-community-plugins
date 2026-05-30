@@ -1,47 +1,52 @@
 # kanban-context plugin 🗂️
 
-Injects recent Kanban board activity (task creation, moves, completions, blocks, worker heartbeats) into agent context via the `pre_llm_call` hook. Gives every agent in a session awareness of what work items are flowing through the board — without requiring them to call board tools explicitly.
+Injects recent Kanban board activity + cross-bot messaging into agent context via the `pre_llm_call` hook.
 
-## The Problem
+## Two Features
 
-The Hermes Kanban system (`hermes kanban`) powers multi-agent work queues with dependency chains, worker claims, and automatic promotion. But by default, the board lives in a SQLite database that agents never read during conversation. Workers using `kanban_*` tools see their assigned task, but orchestrators and conversation agents have **zero visibility** into:
+### 1. Kanban Activity Injection
 
-- Tasks being created and moving through the pipeline
-- Blocked items that may affect downstream work
-- Completed tasks whose output (summaries) could be useful
-- Worker progress notes (heartbeats)
+Gives every agent awareness of what work items are flowing through the board.
 
-This forces agents to operate blindly — they don't know what the team is working on unless someone mentions it in chat.
+### 2. Cross-Bot Messaging (v2.0)
 
-## The Solution
+Because Telegram bots cannot see messages from other bots (hard API limitation), this plugin implements a **cross-bot message bus** using the Kanban board + a shared SQLite ``outbox`` table.
 
-This plugin hooks into `pre_llm_call` and reads the last N events from the shared Kanban SQLite database. It injects a structured context block like:
+**How it works:**
 
+1. **Bot A** (sender) writes a message to the shared ``outbox`` table and creates a Kanban task assigned to **Bot B**
+2. The **Kanban dispatcher** picks up the task and spawns a worker for Bot B
+3. **Bot B** reads the task body (= the message), processes it, and can respond
+4. **Bot B** marks the outbox as ``done`` and completes the Kanban task with a summary
+
+This gives full transparency: every cross-bot exchange is tracked both in the SQLite outbox and in the Kanban board.
+
+**API for plugins/scripts:**
+
+```python
+from plugins.kanban_context import crossbot_send, crossbot_respond, crossbot_get_history
+
+# Send a message
+outbox_id = crossbot_send(
+    to_bot="ti",
+    subject="Check plugin version",
+    body="Please verify the plugin.yaml version matches __init__.py",
+    kanban_task_id="t_abc123"
+)
+
+# Respond to a message
+crossbot_respond(outbox_id, "All versions match. Done!")
 ```
-[Recent Kanban Activity]
 
-- [2h ago] [kanban] **Design auth schema** (created → ready)
-- [30m ago] [kanban] **Implement auth API** (completed)
-- [5m ago] [linkedin-content] **Weekly trends post** (in progress: scraper running)
+### Relationship to multi-agent-context
 
-[End Kanban Activity]
-```
-
-Agents see this before every LLM call — they know what's happening on the board without asking. No board queries, no extra tools, no context-switching.
-
-## Multi-board support
-
-Scans both the default board (`{$HERMES_HOME}/kanban.db`) and all named boards (`{$HERMES_HOME}/kanban/boards/*/kanban.db`). Events from all boards are merged and sorted chronologically, with a board label so agents can distinguish them.
-
-## Relationship to multi-agent-context
-
-The `multi-agent-context` plugin (also in this repo) shares conversation history across Telegram/Discord bots. `kanban-context` complements it by sharing **board** history — together they give agents both conversational and operational context.
+The existing `multi-agent-context` plugin shares conversational history via a shared SQLite DB. `kanban-context` complements it by sharing **board** activity + **cross-bot messages**. Together they give agents conversational context, operational context, AND a reliable bot-to-bot messaging channel.
 
 ## Requirements
 
 - Hermes Agent v0.13.0+ with plugin system
 - Python 3.11+
-- No extra dependencies — uses Python stdlib (`sqlite3`, `json`, `os`)
+- No extra dependencies (stdlib only)
 
 ## Install
 
@@ -58,36 +63,12 @@ plugins:
 
 Restart the gateway.
 
-For multi-profile setups, symlink or copy into each profile's plugins dir:
-```bash
-for agent in profile-a profile-b profile-c; do
-  mkdir -p ~/.hermes/profiles/${agent}/plugins/
-  ln -sf ~/.hermes/plugins/kanban-context \
-          ~/.hermes/profiles/${agent}/plugins/kanban-context
-done
-```
-
 ## Configuration (Environment Variables)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KANBAN_CONTEXT_EVENT_LIMIT` | `10` | Max events to inject per pre-LLM context block |
 | `KANBAN_CONTEXT_LOOKBACK_H` | `12` | Lookback window in hours |
+| `CROSSBOT_BOT_NAME` | *(profile name)* | This bot's name for outbox addressing |
+| `MULTI_AGENT_TG_DB_PATH` | `$HERMES_HOME/data/multi_agent_tg_shared.db` | Shared SQLite DB path |
 
-## Events Tracked
-
-| kind | Description |
-|------|-------------|
-| `created` | Task entered the board (includes target column) |
-| `assigned` | Assignee changed |
-| `claimed` | Worker picked it up |
-| `completed` | Worker finished |
-| `blocked` | Waiting on external input (includes reason) |
-| `unblocked` | No longer blocked |
-| `heartbeat` | Periodic progress note from worker |
-| `spawned` | Worker process started |
-| `archived` | Removed from active view |
-| `commented` | Discussion added |
-| `linked` | Dependency link set |
-| `edited` | Metadata changed |
-| `promoted` | Dependency engine moved it (e.g., todo → ready) |

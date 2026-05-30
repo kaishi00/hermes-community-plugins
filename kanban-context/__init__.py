@@ -1,80 +1,45 @@
-"""kanban-context — injects recent Kanban board activity into agent context.
+"""kanban-context — injects Kanban activity + cross-bot messaging for agents.
 
-Reads from the shared Kanban SQLite database (default board + any named boards)
-and injects recent task events (created, completed, blocked, promoted, heartbeat,
-etc.) as a formatted context block before each LLM call. This gives agents
-awareness of what work items are flowing through the board without requiring
-them to query the board explicitly.
+Two integrated features:
 
-Why this exists
----------------
-The Hermes Kanban system (`hermes kanban`) is a powerful multi-agent work queue,
-but by default the individual cards live in a SQLite database that agents never
-read during conversation. Workers that use the ``kanban_*`` toolset already see
-their assigned task, but orchestrators & other agents in the same session don't
-see board-level activity.
+FEATURE 1: Kanban Activity Injection
+-------------------------------------
+Reads recent task_events from all kanban boards and injects them as a
+``[Recent Kanban Activity]`` context block before each LLM call.
 
-This plugin bridges the gap by injecting ``[Recent Kanban Activity]`` into the
-pre-LLM prompt, so every agent gets lightweight situational awareness of:
-- Tasks being created and moving through the pipeline
-- Blocked items that may affect downstream work
-- Completed tasks whose output may be useful (summary) or whose dependencies
-  were just unblocked
-- Heartbeat notes from workers, which signal progress (or stagnation)
+FEATURE 2: Cross-Bot Messaging
+-------------------------------
+Because Telegram bots cannot see messages from other bots (a hard Telegram
+API limitation), this plugin implements a **cross-bot message bus** using
+a shared SQLite ``outbox`` table.
 
-Duplicate / overlap with multi-agent-context
----------------------------------------------
-The ``multi-agent-context`` plugin (also in this repo) shares Telegram/Discord
-channel history across bot processes. ``kanban-context`` complements it by
-sharing *board* history — the two together give agents both conversational
-and operational context.
+HOW IT WORKS
+------------
+1. Bot A (sender) calls ``crossbot_send()`` with the target bot name and
+   message body.  This:
+   a) Writes a row to the shared ``outbox`` table (pending status)
+   b) Creates a Kanban task assigned to the target bot for tracking
+
+2. Bot B (receiver) discovers the message in one of two ways:
+   - **Kanban dispatcher** picks up the new task and spawns a worker
+   - **pre_llm_call hook** reads the outbox and injects pending messages
+     as ``[Pending Messages]`` context
+
+3. Bot B processes the message by calling ``crossbot_respond()``, which:
+   a) Marks the outbox row as ``done``
+   b) Records the response text
+   c) Completes the Kanban task with a summary
+
+This gives full transparency: every cross-bot exchange is tracked both
+in the shared SQLite outbox and in the Kanban board.
 
 Configuration via environment variables
 -----------------------------------------
-    KANBAN_CONTEXT_EVENT_LIMIT  — Max events to inject per call (default: 10)
-    KANBAN_CONTEXT_LOOKBACK_H   — Lookback window in hours (default: 12)
-
-What gets injected
--------------------
-A block like:
-
-    [Recent Kanban Activity]
-
-    - [2h ago] [kanban] **Design auth schema** (created → ready)
-    - [30m ago] [kanban] **Implement auth API** (completed)
-    - [5m ago] [linkedin-content] **Weekly trends post** (in progress: scraper running)
-    - [End Kanban Activity]
-
-This text appears before the agent's system prompt, within the same context
-window. It is **not** a tool — the agent cannot act on it directly. It's pure
-context so the agent *knows* what is happening on the board.
-
-Events tracked
----------------
-The plugin reads from the ``task_events`` table and recognises these ``kind``
-values (human-readable description in parentheses):
-
-- ``created`` → task entered the board
-- ``assigned`` → assignee changed
-- ``claimed`` → a worker picked it up
-- ``completed`` → worker finished
-- ``blocked`` → waiting on external input (includes reason)
-- ``unblocked`` → no longer blocked
-- ``heartbeat`` → periodic progress note from worker
-- ``spawned`` → worker process started
-- ``archived`` → removed from active view
-- ``commented`` → discussion added
-- ``linked`` → dependency link set
-- ``edited`` → metadata changed
-- ``promoted`` → dependency engine moved it (e.g. todo → ready)
-
-Multi-board support
---------------------
-The plugin scans:
-1. The default board at ``{$HERMES_HOME}/kanban.db`` (legacy / single-board)
-2. Named boards under ``{$HERMES_HOME}/kanban/boards/*/kanban.db``
-
-Events from all boards are merged and sorted chronologically.
+    KANBAN_CONTEXT_EVENT_LIMIT   — Max events to inject (default: 10)
+    KANBAN_CONTEXT_LOOKBACK_H    — Lookback window in hours (default: 12)
+    MULTI_AGENT_TG_DB_PATH       — Shared SQLite DB path (from multi-agent-context)
+    CROSSBOT_BOT_NAME            — This bot's name for outbox addressing
+                                   (default: HERMES profile name or "bot")
 """
 
 from __future__ import annotations
@@ -91,7 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Helpers — resolve paths relative to HERMES_HOME
+# Path resolution
 # ---------------------------------------------------------------------------
 
 _HERMES_HOME: Optional[Path] = None
@@ -109,13 +74,19 @@ def _hermes_home() -> Path:
 
 
 def _kanban_db() -> Path:
-    """Path to the default kanban DB."""
     return _hermes_home() / "kanban.db"
 
 
 def _boards_dir() -> Path:
-    """Path to named boards."""
     return _hermes_home() / "kanban" / "boards"
+
+
+def _shared_db_path() -> str:
+    """Path to the shared multi-agent SQLite DB (from multi-agent-context)."""
+    return os.environ.get(
+        "MULTI_AGENT_TG_DB_PATH",
+        str(_hermes_home() / "data" / "multi_agent_tg_shared.db"),
+    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +97,7 @@ def _boards_dir() -> Path:
 @functools.lru_cache(maxsize=1)
 def _event_limit() -> int:
     try:
-        val = os.environ.get("KANBAN_CONTEXT_EVENT_LIMIT", "10")
-        return int(val)
+        return int(os.environ.get("KANBAN_CONTEXT_EVENT_LIMIT", "10"))
     except (ValueError, TypeError):
         return 10
 
@@ -135,42 +105,207 @@ def _event_limit() -> int:
 @functools.lru_cache(maxsize=1)
 def _lookback_hours() -> int:
     try:
-        val = os.environ.get("KANBAN_CONTEXT_LOOKBACK_H", "12")
-        return int(val)
+        return int(os.environ.get("KANBAN_CONTEXT_LOOKBACK_H", "12"))
     except (ValueError, TypeError):
         return 12
 
 
+def _my_bot_name() -> str:
+    """Return this bot's display name for outbox addressing."""
+    name = os.environ.get("CROSSBOT_BOT_NAME", "").strip()
+    if name:
+        return name
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+        if profile and profile != "default":
+            return profile
+    except Exception:
+        pass
+    return os.environ.get("MULTI_AGENT_BOT_NAME", "bot")
+
+
 def _clear_config_cache() -> None:
-    """Clear cached config values (call after env var changes at runtime)."""
     _event_limit.cache_clear()
     _lookback_hours.cache_clear()
 
 
 # ---------------------------------------------------------------------------
-# Core logic
+# Shared outbox DB — cross-bot message bus
+# ---------------------------------------------------------------------------
+
+_OUTBOX_TABLE = """
+    CREATE TABLE IF NOT EXISTS outbox (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts             REAL    NOT NULL,
+        from_bot       TEXT    NOT NULL,
+        to_bot         TEXT    NOT NULL,
+        subject        TEXT    DEFAULT '',
+        body           TEXT    NOT NULL,
+        kanban_task_id TEXT    DEFAULT '',
+        status         TEXT    DEFAULT 'pending',  -- pending | delivered | done
+        response_text  TEXT    DEFAULT '',
+        completed_at   REAL    DEFAULT NULL
+    )
+"""
+
+
+def _open_shared_db():
+    """Open the shared multi-agent DB, ensuring outbox table exists."""
+    path = _shared_db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(_OUTBOX_TABLE)
+    conn.commit()
+    return conn
+
+
+def crossbot_send(
+    to_bot: str,
+    subject: str,
+    body: str,
+    kanban_task_id: str = "",
+) -> int:
+    """Send a cross-bot message via the shared outbox.
+
+    Args:
+        to_bot: Target bot profile name (e.g. 'ti', 'bravo')
+        subject: Short message subject/headline
+        body: Full message body
+        kanban_task_id: Optional Kanban task ID for tracking
+
+    Returns:
+        The outbox row ID.
+    """
+    conn = _open_shared_db()
+    now = time.time()
+    from_bot = _my_bot_name()
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO outbox (ts, from_bot, to_bot, subject, body, kanban_task_id, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                (now, from_bot, to_bot, subject[:200], body, kanban_task_id),
+            )
+            row_id = cur.lastrowid
+        logger.info(
+            "crossbot: sent message #%d from '%s' to '%s' (subject='%s', kanban=%s)",
+            row_id, from_bot, to_bot, subject[:60], kanban_task_id or "none",
+        )
+        return row_id
+    finally:
+        conn.close()
+
+
+def crossbot_respond(outbox_id: int, response_text: str) -> bool:
+    """Mark a message as done with the response text.
+
+    Args:
+        outbox_id: The outbox row ID from crossbot_send()
+        response_text: The response/reply content
+
+    Returns:
+        True if successful, False if message not found.
+    """
+    conn = _open_shared_db()
+    now = time.time()
+    try:
+        cur = conn.execute(
+            "UPDATE outbox SET status='done', response_text=?, completed_at=? WHERE id=?",
+            (response_text[:2000], now, outbox_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            logger.warning("crossbot: message #%d not found", outbox_id)
+            return False
+        logger.info("crossbot: message #%d responded (%d chars)", outbox_id, len(response_text))
+        return True
+    finally:
+        conn.close()
+
+
+def _fetch_pending_messages(for_bot: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Fetch all pending (undelivered) messages for *for_bot*.
+
+    If *for_bot* is None, uses the current bot name.
+    """
+    target = for_bot or _my_bot_name()
+    conn = _open_shared_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, from_bot, subject, body, ts, kanban_task_id "
+            "FROM outbox "
+            "WHERE to_bot=? AND status='pending' "
+            "ORDER BY ts ASC",
+            (target,),
+        ).fetchall()
+        results = []
+        for r in rows:
+            results.append({
+                "id": r[0],
+                "from_bot": r[1],
+                "subject": r[2] or "",
+                "body": r[3],
+                "ts": r[4],
+                "kanban_task_id": r[5] or "",
+            })
+        return results
+    finally:
+        conn.close()
+
+
+def crossbot_get_history(
+    for_bot: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Get recent cross-bot message history for the given bot."""
+    target = for_bot or _my_bot_name()
+    conn = _open_shared_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, from_bot, to_bot, subject, body, status, response_text, ts, completed_at "
+            "FROM outbox "
+            "WHERE from_bot=? OR to_bot=? "
+            "ORDER BY ts DESC LIMIT ?",
+            (target, target, limit),
+        ).fetchall()
+        results = []
+        for r in rows:
+            results.append({
+                "id": r[0],
+                "from_bot": r[1],
+                "to_bot": r[2],
+                "subject": r[3] or "",
+                "body": r[4],
+                "status": r[5],
+                "response_text": r[6] or "",
+                "ts": r[7],
+                "completed_at": r[8],
+            })
+        return results
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Kanban board reading
 # ---------------------------------------------------------------------------
 
 
 def _iter_boards() -> List[Tuple[str, str]]:
-    """Yield (db_path, board_label) pairs for all available kanban boards.
-
-    Labels let the user distinguish events from different boards in the
-    injected context block.
-    """
+    """Yield (db_path, board_label) pairs for all available kanban boards."""
     results: List[Tuple[str, str]] = []
-
     default = _kanban_db()
     if default.is_file():
         results.append((str(default), "kanban"))
-
     boards = _boards_dir()
     if boards.is_dir():
         for name in sorted(os.listdir(str(boards))):
             board_db = boards / name / "kanban.db"
             if board_db.is_file():
                 results.append((str(board_db), name))
-
     return results
 
 
@@ -225,7 +360,6 @@ def _read_kanban_events() -> str:
         )
         return ""
 
-    # Sort newest-first, then take the top N, reverse to chronological
     events.sort(key=lambda e: e["ts"], reverse=True)
     events = events[:limit]
     events.reverse()
@@ -239,13 +373,42 @@ def _read_kanban_events() -> str:
         task_status = ev["task_status"] or "?"
         desc = _describe_event(kind, ev["payload"], task_status)
         lines.append(f"- [{when}] [{board}] **{title}** ({desc})")
-
     lines.extend(["", "[End Kanban Activity]"])
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Pending cross-bot messages
+# ---------------------------------------------------------------------------
+
+
+def _read_pending_messages() -> str:
+    """Read pending outbox messages for this bot and format as context."""
+    pending = _fetch_pending_messages()
+    if not pending:
+        return ""
+
+    lines = ["[Pending Messages]", ""]
+    for msg in pending:
+        when = _fmt_time(msg["ts"])
+        subj = msg["subject"] or "(no subject)"
+        body = msg["body"][:200]
+        if len(msg["body"]) > 200:
+            body += "..."
+        task_ref = f" (kanban: {msg['kanban_task_id']})" if msg["kanban_task_id"] else ""
+        lines.append(f"- [{when}] From **{msg['from_bot']}** — {subj}{task_ref}")
+        lines.append(f"  > {body}")
+    lines.extend(["", "To respond, process the linked Kanban task and call crossbot_respond().", ""])
+    lines.append("[End Pending Messages]")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+
 def _fmt_time(ts: float) -> str:
-    """Format a unix timestamp to a human-friendly relative string."""
     elapsed = time.time() - ts
     if elapsed < 0:
         return "just now"
@@ -259,7 +422,6 @@ def _fmt_time(ts: float) -> str:
 
 
 def _describe_event(kind: str, payload: Dict[str, Any], task_status: str) -> str:
-    """Map event kinds to short human-readable descriptions."""
     descriptions = {
         "created": f"created → {payload.get('status', 'triage')}",
         "assigned": f"assigned to {payload.get('assignee', 'someone')}",
@@ -289,19 +451,31 @@ def _trunc(text: str, max_len: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Hook callback
+# Hook callbacks
 # ---------------------------------------------------------------------------
 
 
 def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
-    """pre_llm_call hook — injects recent Kanban board activity as context."""
-    ctx_text = _read_kanban_events()
-    if ctx_text:
+    """pre_llm_call hook — injects board activity + pending messages."""
+    parts = []
+
+    # Part 1: Kanban board activity
+    board_ctx = _read_kanban_events()
+    if board_ctx:
+        parts.append(board_ctx)
+
+    # Part 2: Pending cross-bot messages
+    pending_ctx = _read_pending_messages()
+    if pending_ctx:
+        parts.append(pending_ctx)
+
+    if parts:
+        combined = "\n\n".join(parts)
         logger.info(
-            "kanban-context: injected %d chars of recent board activity",
-            len(ctx_text),
+            "kanban-context: injected %d chars (%d parts)",
+            len(combined), len(parts),
         )
-        return {"context": ctx_text}
+        return {"context": combined}
     return None
 
 
@@ -313,7 +487,7 @@ def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _inject_kanban_context)
     logger.info(
-        "kanban-context plugin v1.1.0 registered "
-        "(event_limit=%d, lookback=%dh, home=%s)",
-        _event_limit(), _lookback_hours(), _hermes_home(),
+        "kanban-context plugin v2.0 registered "
+        "(event_limit=%d, lookback=%dh, home=%s, bot=%s)",
+        _event_limit(), _lookback_hours(), _hermes_home(), _my_bot_name(),
     )
