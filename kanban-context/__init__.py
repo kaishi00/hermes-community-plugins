@@ -313,7 +313,7 @@ def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _inject_kanban_context)
     logger.info(
-        "kanban-context plugin v1.1.0 registered "
+        "kanban-context plugin v1.0.0 registered "
         "(event_limit=%d, lookback=%dh, home=%s)",
         _event_limit(), _lookback_hours(), _hermes_home(),
     )
