@@ -79,6 +79,7 @@ Events from all boards are merged and sorted chronologically.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -122,18 +123,28 @@ def _boards_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1)
 def _event_limit() -> int:
     try:
-        return int(os.environ.get("KANBAN_CONTEXT_EVENT_LIMIT", "10"))
-    except ValueError:
+        val = os.environ.get("KANBAN_CONTEXT_EVENT_LIMIT", "10")
+        return int(val)
+    except (ValueError, TypeError):
         return 10
 
 
+@functools.lru_cache(maxsize=1)
 def _lookback_hours() -> int:
     try:
-        return int(os.environ.get("KANBAN_CONTEXT_LOOKBACK_H", "12"))
-    except ValueError:
+        val = os.environ.get("KANBAN_CONTEXT_LOOKBACK_H", "12")
+        return int(val)
+    except (ValueError, TypeError):
         return 12
+
+
+def _clear_config_cache() -> None:
+    """Clear cached config values (call after env var changes at runtime)."""
+    _event_limit.cache_clear()
+    _lookback_hours.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -171,20 +182,19 @@ def _read_kanban_events() -> str:
 
     for db_path, board_label in _iter_boards():
         try:
-            conn = sqlite3.connect(db_path, timeout=5)
-            rows = conn.execute(
-                """
-                SELECT e.id, e.task_id, e.kind, e.payload, e.created_at,
-                       t.title, t.status
-                FROM task_events e
-                LEFT JOIN tasks t ON t.id = e.task_id
-                WHERE e.created_at >= ?
-                ORDER BY e.created_at DESC
-                LIMIT ?
-                """,
-                (cutoff, limit),
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(db_path, timeout=5) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT e.id, e.task_id, e.kind, e.payload, e.created_at,
+                           t.title, t.status
+                    FROM task_events e
+                    LEFT JOIN tasks t ON t.id = e.task_id
+                    WHERE e.created_at >= ?
+                    ORDER BY e.created_at DESC
+                    LIMIT ?
+                    """,
+                    (cutoff, limit),
+                ).fetchall()
             for row in rows:
                 _eid, task_id, kind, payload_json, created_at, title, task_status = row
                 payload: Dict[str, Any] = {}
@@ -209,6 +219,10 @@ def _read_kanban_events() -> str:
             )
 
     if not events:
+        logger.debug(
+            "kanban-context: no recent events (lookback=%dh, boards=%d)",
+            _lookback_hours(), len(_iter_boards()),
+        )
         return ""
 
     # Sort newest-first, then take the top N, reverse to chronological
@@ -233,6 +247,8 @@ def _read_kanban_events() -> str:
 def _fmt_time(ts: float) -> str:
     """Format a unix timestamp to a human-friendly relative string."""
     elapsed = time.time() - ts
+    if elapsed < 0:
+        return "just now"
     if elapsed < 60:
         return "just now"
     if elapsed < 3600:
@@ -297,7 +313,7 @@ def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _inject_kanban_context)
     logger.info(
-        "kanban-context plugin v1.0 registered "
+        "kanban-context plugin v1.1.0 registered "
         "(event_limit=%d, lookback=%dh, home=%s)",
         _event_limit(), _lookback_hours(), _hermes_home(),
     )

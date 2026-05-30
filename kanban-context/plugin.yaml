@@ -2,5 +2,6 @@ name: kanban-context
 version: 1.0.0
 description: "Injects recent Kanban board activity (task creation, moves, completions, blocks, worker heartbeats) into agent context via pre_llm_call hook. Gives agents awareness of work items flowing through all boards without requiring explicit board queries."
 author: "Franklin Bravos (@franklinbravos)"
+python: ">=3.11"
 hooks:
   - pre_llm_call
