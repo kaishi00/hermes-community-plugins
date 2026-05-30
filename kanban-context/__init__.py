@@ -134,7 +134,7 @@ def _clear_config_cache() -> None:
 # Shared outbox DB — cross-bot message bus
 # ---------------------------------------------------------------------------
 
-_OUTBOX_TABLE = """
+_OUTBOX_TABLE = """\
     CREATE TABLE IF NOT EXISTS outbox (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         ts             REAL    NOT NULL,
@@ -149,15 +149,34 @@ _OUTBOX_TABLE = """
     )
 """
 
+_RESPONSE_LOG_TABLE = """\
+    CREATE TABLE IF NOT EXISTS response_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts            REAL    NOT NULL,
+        bot_name      TEXT    NOT NULL,
+        chat_key      TEXT    NOT NULL,
+        user_message  TEXT    NOT NULL,
+        user_id       TEXT    DEFAULT '',
+        responded     INTEGER DEFAULT 0,  -- 0=pending, 1=responded
+        responder     TEXT    DEFAULT ''
+    )
+"""
+_CREATE_INDEX_RL = """\
+    CREATE INDEX IF NOT EXISTS idx_rl_chat_msg 
+    ON response_log (chat_key, user_message)
+"""
+
 
 def _open_shared_db():
-    """Open the shared multi-agent DB, ensuring outbox table exists."""
+    """Open the shared multi-agent DB, ensuring outbox + response_log tables exist."""
     path = _shared_db_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(_OUTBOX_TABLE)
+    conn.execute(_RESPONSE_LOG_TABLE)
+    conn.execute(_CREATE_INDEX_RL)
     conn.commit()
     return conn
 
@@ -491,8 +510,20 @@ def _cleanup_old_outbox() -> int:
         )
         conn.commit()
         deleted = cur.rowcount
-        if deleted > 0:
-            logger.info("kanban-context: cleaned %d old outbox (retention=%dd)", deleted, retention)
+
+        # Also clean old response_log entries
+        cur2 = conn.execute(
+            "DELETE FROM response_log WHERE ts < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        rl_deleted = cur2.rowcount
+
+        if deleted > 0 or rl_deleted > 0:
+            logger.info(
+                "kanban-context: cleaned %d outbox + %d response_log (retention=%dd)",
+                deleted, rl_deleted, retention,
+            )
         return deleted
     except Exception as exc:
         logger.warning("kanban-context: outbox cleanup failed: %s", exc)
@@ -558,6 +589,136 @@ def run_maintenance(force: bool = False) -> None:
     _cleanup_stale_pending()
     _cleanup_old_log_files()
     _last_cleanup = now
+
+
+# ---------------------------------------------------------------------------
+# Response coordination — prevent duplicate bot replies in shared groups
+# ---------------------------------------------------------------------------
+
+_RESPONSE_COOLDOWN: float = 30.0  # seconds — if bot A responded, bot B waits
+
+
+def _resolve_chat_key_from_kwargs(kwargs: dict) -> str:
+    """Derive a chat_key from the hook kwargs."""
+    session_id = kwargs.get("session_id", "") or ""
+    user_message = kwargs.get("user_message", "") or ""
+    platform = kwargs.get("platform", "") or ""
+
+    # Try to parse from session_id (format: agent:main:platform:type:chat_id[:thread_id])
+    parts = session_id.split(":")
+    if len(parts) >= 5:
+        chat_id = parts[4]
+        if len(parts) > 5:
+            return f"{chat_id}:{parts[5]}"
+        return chat_id
+
+    # Fallback: use user_message hash as chat_key (less precise but functional)
+    import hashlib
+    return f"unknown_{hashlib.md5(session_id.encode()).hexdigest()[:12]}"
+
+
+def claim_response(user_message: str, chat_key: str) -> bool:
+    """Try to claim a response slot for this user_message in this chat.
+
+    Returns True if caller should respond (first to claim),
+    Returns False if another bot already claimed it (skip).
+    """
+    if not user_message or not chat_key:
+        return True  # Can't check — default to respond
+
+    conn = _open_shared_db()
+    now = time.time()
+    bot = _my_bot_name()
+    try:
+        # Check if someone already responded recently
+        cutoff = now - _RESPONSE_COOLDOWN
+        existing = conn.execute(
+            "SELECT responder FROM response_log "
+            "WHERE chat_key=? AND user_message=? AND ts >= ? AND responded=1 "
+            "ORDER BY ts DESC LIMIT 1",
+            (chat_key, user_message[:200], cutoff),
+        ).fetchone()
+
+        if existing is not None:
+            other = existing[0]
+            if other != bot:
+                logger.info(
+                    "kanban-context: skipping response — '%s' already replied "
+                    "to msg in chat %s (cooldown=%ss)",
+                    other, chat_key, _RESPONSE_COOLDOWN,
+                )
+                return False
+
+        # Claim the slot
+        conn.execute(
+            "INSERT INTO response_log (ts, bot_name, chat_key, user_message, responded, responder) "
+            "VALUES (?, ?, ?, ?, 1, ?)",
+            (now, bot, chat_key, user_message[:200], bot),
+        )
+        conn.commit()
+        logger.debug(
+            "kanban-context: claimed response slot for chat=%s bot=%s",
+            chat_key, bot,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("kanban-context: claim_response failed: %s", exc)
+        return True  # On error, let the bot respond (fail open)
+    finally:
+        conn.close()
+
+
+def _inject_response_coordination(**kwargs) -> Optional[Dict[str, str]]:
+    """pre_llm_call hook — injects context about other bots' responses.
+
+    If another bot already responded to this user's message in this
+    chat within the cooldown period, inject a warning so the agent
+    knows to coordinate instead of repeating.
+    """
+    user_message = kwargs.get("user_message", "") or ""
+    chat_key = _resolve_chat_key_from_kwargs(kwargs)
+
+    if not user_message or not chat_key:
+        return None
+
+    conn = _open_shared_db()
+    now = time.time()
+    cutoff = now - _RESPONSE_COOLDOWN
+    try:
+        others = conn.execute(
+            "SELECT responder, ts FROM response_log "
+            "WHERE chat_key=? AND user_message=? AND ts >= ? AND responded=1 "
+            "AND responder != ? "
+            "ORDER BY ts DESC LIMIT 3",
+            (chat_key, user_message[:200], cutoff, _my_bot_name()),
+        ).fetchall()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+    if not others:
+        return None
+
+    lines = ["[Response Coordination]", ""]
+    for responder, ts in others:
+        ago = _fmt_time(ts)
+        lines.append(f"- **{responder}** responded {ago}")
+    lines.extend([
+        "",
+        "Another bot has already responded to this message. "
+        "Unless explicitly @mentioned or asked a direct follow-up, "
+        "avoid repeating what was already said. If you have something "
+        "new to add, acknowledge the other bot's response first.",
+        "",
+        "[End Response Coordination]",
+    ])
+    ctx = "\n".join(lines)
+    logger.info(
+        "kanban-context: coordination context injected — %d other bot(s) "
+        "already responded in chat %s", len(others), chat_key,
+    )
+    return {"context": ctx}
 
 
 # ---------------------------------------------------------------------------
@@ -917,3 +1078,4 @@ def register(ctx) -> None:
 
     ctx.register_hook("pre_llm_call", _inject_kanban_context)
     ctx.register_hook("pre_llm_call", _handle_status_command)
+    ctx.register_hook("pre_llm_call", _inject_response_coordination)
