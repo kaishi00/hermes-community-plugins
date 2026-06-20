@@ -144,6 +144,7 @@ Both platforms: the agent now knows what everyone said — but still only *respo
 - **Self-filtering (Discord):** Strips the bot's own messages from history (no echo chamber)
 - **Cross-process shared state (Telegram):** SQLite WAL mode enables multiple agent processes to read/write the same DB safely
 - **Cached (Discord):** 10-second TTL prevents redundant API calls within the same turn
+- **Channel skip list (v2.1):** Exclude specific Discord channels from injection — useful for `free_response_channels` where the agent already sees every message and injection would be redundant
 - **Rate-limit handling:** Respects Discord's `429 Retry-After`
 - **Mention sanitization:** Strips Discord's `<@id>` formatting for readability
 - **Auto-pruning (Telegram):** Messages older than 48 hours are automatically cleaned from the DB
@@ -213,6 +214,7 @@ cp -r multi-agent-context ~/.hermes/plugins/multi-agent-context
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MULTI_AGENT_HISTORY_COUNT` | `20` | Number of recent messages to inject as context (both platforms) |
+| `MULTI_AGENT_SKIP_CHANNELS` | *(empty)* | Comma-separated Discord channel IDs to skip injection entirely (e.g. `free_response_channels` that already have full context). Empty = inject everywhere. |
 | `DISCORD_BOT_TOKEN` | *(auto-set)* | Discord bot token — set automatically by Hermes |
 | `MULTI_AGENT_BOT_NAME` | *(profile name)* | Display name for this bot in Telegram shared history |
 | `MULTI_AGENT_TG_DB_PATH` | `/root/.hermes/data/multi_agent_tg_shared.db` | Path to the shared SQLite database |
