@@ -129,7 +129,7 @@ def _format_discord_messages(messages: List[dict], self_bot_id: Optional[str], l
         author = msg.get("author", {})
         author_id = str(author.get("id", ""))
         content = msg.get("content", "").strip()
-        if author_id == self_bot_id or not content or msg.get("type", 0) > 3:
+        if author_id == self_bot_id or not content or msg.get("type", 0) not in (0, 19):
             continue
         display = author.get("global_name") or author.get("username") or f"User-{author_id[:6]}"
         content = re.sub(r"<@!?(\d+)>", r"@<\1>", content)
